@@ -7,7 +7,7 @@ import { createEnrollRequest, getNextFingerprintId, watchEnrollRequest } from '.
 import { getErrorMessage } from '../lib/errors';
 
 const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[] | null) => void }) => {
-  const requiredStable = 3;
+  const requiredStable = 5;
   const [cameraActive, setCameraActive] = useState(false);
   const [starting, setStarting] = useState(false);
   const [detecting, setDetecting] = useState(false);
@@ -16,6 +16,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
   const [thumbnail, setThumbnail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [stableCount, setStableCount] = useState(0);
+  const [qualityHint, setQualityHint] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -52,6 +53,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     setCameraActive(false);
     setDetecting(false);
     setStableCount(0);
+    setQualityHint(null);
     lastDescriptorRef.current = null;
     stableDescriptorsRef.current = [];
     captureInProgressRef.current = false;
@@ -178,6 +180,61 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     return canvas.toDataURL('image/jpeg', 0.8);
   };
 
+  const computeSharpness = (videoEl: HTMLVideoElement, box: faceapi.Box) => {
+    const vw = videoEl.videoWidth || 0;
+    const vh = videoEl.videoHeight || 0;
+    if (!vw || !vh) return null;
+
+    const cropX = Math.max(0, Math.floor(box.x));
+    const cropY = Math.max(0, Math.floor(box.y));
+    const cropW = Math.max(1, Math.floor(box.width));
+    const cropH = Math.max(1, Math.floor(box.height));
+
+    const canvas = document.createElement('canvas');
+    const size = 96;
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+
+    ctx.drawImage(videoEl, cropX, cropY, cropW, cropH, 0, 0, size, size);
+    const { data } = ctx.getImageData(0, 0, size, size);
+
+    const gray = new Float32Array(size * size);
+    let meanLum = 0;
+    for (let i = 0; i < gray.length; i += 1) {
+      const r = data[i * 4];
+      const g = data[i * 4 + 1];
+      const b = data[i * 4 + 2];
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      gray[i] = lum;
+      meanLum += lum;
+    }
+    meanLum /= gray.length;
+
+    let sum = 0;
+    let sumSq = 0;
+    for (let y = 1; y < size - 1; y += 1) {
+      for (let x = 1; x < size - 1; x += 1) {
+        const idx = y * size + x;
+        const center = gray[idx];
+        const up = gray[idx - size];
+        const down = gray[idx + size];
+        const left = gray[idx - 1];
+        const right = gray[idx + 1];
+        const lap = -4 * center + up + down + left + right;
+        sum += lap;
+        sumSq += lap * lap;
+      }
+    }
+
+    const n = (size - 2) * (size - 2);
+    const mean = sum / n;
+    const variance = sumSq / n - mean * mean;
+
+    return { sharpness: variance, brightness: meanLum };
+  };
+
   useEffect(() => {
     if (!cameraActive || !detecting || captured) return;
     if (!modelsReadyRef.current) return;
@@ -200,20 +257,46 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
 
         const descriptor = detection?.descriptor ?? null;
         const box = detection?.detection?.box ?? null;
+        const score = detection?.detection?.score ?? null;
 
-        if (descriptor && box) {
+        if (detection && descriptor && box) {
           const videoW = videoRef.current.videoWidth || 1;
           const videoH = videoRef.current.videoHeight || 1;
           const faceAreaRatio = (box.width * box.height) / (videoW * videoH);
+          const cx = (box.x + box.width / 2) / videoW;
+          const cy = (box.y + box.height / 2) / videoH;
 
-          if (faceAreaRatio < 0.06) {
+          const leftEye = detection.landmarks.getLeftEye();
+          const rightEye = detection.landmarks.getRightEye();
+          const lx = leftEye.reduce((acc, p) => acc + p.x, 0) / leftEye.length;
+          const ly = leftEye.reduce((acc, p) => acc + p.y, 0) / leftEye.length;
+          const rx = rightEye.reduce((acc, p) => acc + p.x, 0) / rightEye.length;
+          const ry = rightEye.reduce((acc, p) => acc + p.y, 0) / rightEye.length;
+          const rollDeg = (Math.atan2(ry - ly, rx - lx) * 180) / Math.PI;
+
+          const quality = computeSharpness(videoRef.current, box);
+          const sharpness = quality?.sharpness ?? null;
+          const brightness = quality?.brightness ?? null;
+
+          let hint: string | null = null;
+          if (typeof score === 'number' && score < 0.7) hint = 'Face not clear enough. Hold still.';
+          if (faceAreaRatio < 0.12) hint = 'Move closer. Make your face fill the frame.';
+          if (Math.abs(cx - 0.5) > 0.18 || Math.abs(cy - 0.5) > 0.18) hint = 'Center your face in the frame.';
+          if (Math.abs(rollDeg) > 12) hint = 'Keep your head straight.';
+          if (typeof sharpness === 'number' && sharpness < 120) hint = 'Too blurry. Improve lighting and hold still.';
+          if (typeof brightness === 'number' && brightness < 45) hint = 'Too dark. Add more light.';
+
+          if (hint) {
+            setQualityHint(hint);
             setStableCount(0);
             lastDescriptorRef.current = null;
             stableDescriptorsRef.current = [];
           } else {
+            if (qualityHint) setQualityHint(null);
+
             const last = lastDescriptorRef.current;
             const distance = last ? faceapi.euclideanDistance(last, descriptor) : 0;
-            const stable = !last || distance < 0.45;
+            const stable = !last || distance < 0.35;
 
             if (stable) {
               stableDescriptorsRef.current.push(descriptor);
@@ -243,8 +326,9 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
               setStableCount(1);
             }
           }
-        } else {
+          } else {
           setStableCount(0);
+          setQualityHint('No face detected. Look at the camera.');
           lastDescriptorRef.current = null;
           stableDescriptorsRef.current = [];
         }
@@ -269,7 +353,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
         rafRef.current = null;
       }
     };
-  }, [cameraActive, detecting, captured, onFaceCaptured]);
+  }, [cameraActive, detecting, captured, onFaceCaptured, qualityHint]);
 
   const handleRetake = () => {
     stopCamera();
@@ -313,7 +397,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
             </p>
           ) : detecting ? (
             <p className="text-xs text-gray-400">
-              Hold still... {stableCount}/{requiredStable}
+              {qualityHint ? qualityHint : `Hold still... ${stableCount}/${requiredStable}`}
             </p>
           ) : (
             <p className="text-xs text-gray-400">Tap to open camera</p>
@@ -325,7 +409,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
             <video ref={videoRef} className="w-full aspect-square object-cover" playsInline muted autoPlay />
             <div className="absolute bottom-2 left-2 right-2 text-center">
               <span className="text-xs bg-black/60 text-white px-2 py-1 rounded">
-                {detecting ? `Detecting... ${stableCount}/${requiredStable}` : 'Camera ready'}
+                {detecting ? (qualityHint ? qualityHint : `Detecting... ${stableCount}/${requiredStable}`) : 'Camera ready'}
               </span>
             </div>
           </div>

@@ -27,6 +27,7 @@ export default function Dashboard() {
   const faceModelsReadyRef = useRef(false);
   const faceUsersRef = useRef<Array<{ id: string; name: string; descriptor: Float32Array }>>([]);
   const faceUnlockSentRef = useRef(false);
+  const faceMatchStreakRef = useRef<{ userId: string | null; count: number }>({ userId: null, count: 0 });
 
   useEffect(() => {
     loadData();
@@ -104,6 +105,7 @@ export default function Dashboard() {
     }
     setFaceDetecting(false);
     setFaceStarting(false);
+    faceMatchStreakRef.current = { userId: null, count: 0 };
   };
 
   const getCameraError = (e: unknown) => {
@@ -145,6 +147,61 @@ export default function Dashboard() {
     } finally {
       setFaceModelLoading(false);
     }
+  };
+
+  const computeSharpness = (videoEl: HTMLVideoElement, box: faceapi.Box) => {
+    const vw = videoEl.videoWidth || 0;
+    const vh = videoEl.videoHeight || 0;
+    if (!vw || !vh) return null;
+
+    const cropX = Math.max(0, Math.floor(box.x));
+    const cropY = Math.max(0, Math.floor(box.y));
+    const cropW = Math.max(1, Math.floor(box.width));
+    const cropH = Math.max(1, Math.floor(box.height));
+
+    const canvas = document.createElement('canvas');
+    const size = 96;
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+
+    ctx.drawImage(videoEl, cropX, cropY, cropW, cropH, 0, 0, size, size);
+    const { data } = ctx.getImageData(0, 0, size, size);
+
+    const gray = new Float32Array(size * size);
+    let meanLum = 0;
+    for (let i = 0; i < gray.length; i += 1) {
+      const r = data[i * 4];
+      const g = data[i * 4 + 1];
+      const b = data[i * 4 + 2];
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      gray[i] = lum;
+      meanLum += lum;
+    }
+    meanLum /= gray.length;
+
+    let sum = 0;
+    let sumSq = 0;
+    for (let y = 1; y < size - 1; y += 1) {
+      for (let x = 1; x < size - 1; x += 1) {
+        const idx = y * size + x;
+        const center = gray[idx];
+        const up = gray[idx - size];
+        const down = gray[idx + size];
+        const left = gray[idx - 1];
+        const right = gray[idx + 1];
+        const lap = -4 * center + up + down + left + right;
+        sum += lap;
+        sumSq += lap * lap;
+      }
+    }
+
+    const n = (size - 2) * (size - 2);
+    const mean = sum / n;
+    const variance = sumSq / n - mean * mean;
+
+    return { sharpness: variance, brightness: meanLum };
   };
 
   const loadFaceUsers = async () => {
@@ -243,7 +300,9 @@ export default function Dashboard() {
         setFaceDetecting(true);
 
         const options = new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.65 });
-        const threshold = 0.5;
+        const threshold = 0.42;
+        const margin = 0.08;
+        const requiredStreak = 3;
 
         const loop = async () => {
           if (!faceUnlockOpen) return;
@@ -257,16 +316,80 @@ export default function Dashboard() {
               .withFaceLandmarks()
               .withFaceDescriptor();
 
-            if (detection?.descriptor) {
-              const candidate = detection.descriptor;
+            const descriptor = detection?.descriptor ?? null;
+            const box = detection?.detection?.box ?? null;
+            const score = detection?.detection?.score ?? null;
+
+            if (detection && descriptor && box) {
+              const videoW = faceVideoRef.current.videoWidth || 1;
+              const videoH = faceVideoRef.current.videoHeight || 1;
+              const faceAreaRatio = (box.width * box.height) / (videoW * videoH);
+              const cx = (box.x + box.width / 2) / videoW;
+              const cy = (box.y + box.height / 2) / videoH;
+
+              const leftEye = detection.landmarks.getLeftEye();
+              const rightEye = detection.landmarks.getRightEye();
+              const lx = leftEye.reduce((acc, p) => acc + p.x, 0) / leftEye.length;
+              const ly = leftEye.reduce((acc, p) => acc + p.y, 0) / leftEye.length;
+              const rx = rightEye.reduce((acc, p) => acc + p.x, 0) / rightEye.length;
+              const ry = rightEye.reduce((acc, p) => acc + p.y, 0) / rightEye.length;
+              const rollDeg = (Math.atan2(ry - ly, rx - lx) * 180) / Math.PI;
+
+              const quality = computeSharpness(faceVideoRef.current, box);
+              const sharpness = quality?.sharpness ?? null;
+              const brightness = quality?.brightness ?? null;
+
+              const qualityOk =
+                (typeof score !== 'number' || score >= 0.7) &&
+                faceAreaRatio >= 0.12 &&
+                Math.abs(cx - 0.5) <= 0.18 &&
+                Math.abs(cy - 0.5) <= 0.18 &&
+                Math.abs(rollDeg) <= 12 &&
+                (typeof sharpness !== 'number' || sharpness >= 120) &&
+                (typeof brightness !== 'number' || brightness >= 45);
+
+              if (!qualityOk) {
+                faceMatchStreakRef.current = { userId: null, count: 0 };
+                faceRafRef.current = requestAnimationFrame(() => {
+                  void loop();
+                });
+                return;
+              }
+
+              const candidate = descriptor;
               let best: { id: string; name: string; distance: number } | null = null;
+              let secondBestDistance: number | null = null;
 
               for (const u of faceUsersRef.current) {
                 const distance = faceapi.euclideanDistance(u.descriptor, candidate);
-                if (!best || distance < best.distance) best = { id: u.id, name: u.name, distance };
+                if (!best || distance < best.distance) {
+                  if (best) secondBestDistance = best.distance;
+                  best = { id: u.id, name: u.name, distance };
+                } else if (secondBestDistance === null || distance < secondBestDistance) {
+                  secondBestDistance = distance;
+                }
               }
 
-              if (best && best.distance <= threshold) {
+              const ambiguous =
+                best &&
+                secondBestDistance !== null &&
+                secondBestDistance - best.distance < margin;
+
+              if (best && best.distance <= threshold && !ambiguous) {
+                const current = faceMatchStreakRef.current;
+                if (current.userId === best.id) {
+                  faceMatchStreakRef.current = { userId: best.id, count: current.count + 1 };
+                } else {
+                  faceMatchStreakRef.current = { userId: best.id, count: 1 };
+                }
+
+                if (faceMatchStreakRef.current.count < requiredStreak) {
+                  faceRafRef.current = requestAnimationFrame(() => {
+                    void loop();
+                  });
+                  return;
+                }
+
                 faceUnlockSentRef.current = true;
                 setFaceMatchedName(best.name);
 
@@ -285,6 +408,8 @@ export default function Dashboard() {
                 toast.success(`Face matched: ${best.name}. Unlock request sent.`);
                 setFaceUnlockOpen(false);
                 return;
+              } else {
+                faceMatchStreakRef.current = { userId: null, count: 0 };
               }
             }
           } catch (e) {

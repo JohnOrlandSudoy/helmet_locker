@@ -6,8 +6,11 @@ import { toast } from 'sonner';
 import { createEnrollRequest, getNextFingerprintId, watchEnrollRequest } from '../lib/enrollRequests';
 import { getErrorMessage } from '../lib/errors';
 
+const FACE_STEPS = ['Front', 'Left', 'Right', 'Blink'] as const;
+
 const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[] | null) => void }) => {
   const requiredStable = 5;
+  type Step = (typeof FACE_STEPS)[number];
   const [cameraActive, setCameraActive] = useState(false);
   const [starting, setStarting] = useState(false);
   const [detecting, setDetecting] = useState(false);
@@ -17,6 +20,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
   const [error, setError] = useState<string | null>(null);
   const [stableCount, setStableCount] = useState(0);
   const [qualityHint, setQualityHint] = useState<string | null>(null);
+  const [stepIndex, setStepIndex] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -26,6 +30,8 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
   const lastDescriptorRef = useRef<Float32Array | null>(null);
   const stableDescriptorsRef = useRef<Float32Array[]>([]);
   const captureInProgressRef = useRef(false);
+  const stepAveragesRef = useRef<Float32Array[]>([]);
+  const blinkStateRef = useRef<'need_close' | 'need_open' | 'done'>('need_close');
 
   const getCameraError = (e: unknown) => {
     if (e && typeof e === 'object' && 'name' in e) {
@@ -54,9 +60,12 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     setDetecting(false);
     setStableCount(0);
     setQualityHint(null);
+    setStepIndex(0);
     lastDescriptorRef.current = null;
     stableDescriptorsRef.current = [];
     captureInProgressRef.current = false;
+    stepAveragesRef.current = [];
+    blinkStateRef.current = 'need_close';
   };
 
   useEffect(() => {
@@ -180,6 +189,36 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     return canvas.toDataURL('image/jpeg', 0.8);
   };
 
+  const averageDescriptors = (descriptors: Float32Array[]) => {
+    const last = descriptors[descriptors.length - 1];
+    const dims = last?.length ?? 0;
+    const avg = new Float32Array(dims);
+    if (!dims) return avg;
+
+    for (const d of descriptors) {
+      for (let i = 0; i < dims; i += 1) avg[i] += d[i];
+    }
+    for (let i = 0; i < dims; i += 1) avg[i] /= descriptors.length;
+    return avg;
+  };
+
+  const computeYaw = (landmarks: faceapi.FaceLandmarks68, box: faceapi.Box) => {
+    const noseTip = landmarks.positions[30];
+    const centerX = box.x + box.width / 2;
+    const cameraYaw = (noseTip.x - centerX) / box.width;
+    const userYaw = -cameraYaw;
+    return userYaw;
+  };
+
+  const computeEyeAspectRatio = (eye: faceapi.Point[]) => {
+    if (eye.length < 6) return null;
+    const dist = (a: faceapi.Point, b: faceapi.Point) => Math.hypot(a.x - b.x, a.y - b.y);
+    const a = dist(eye[1], eye[5]);
+    const b = dist(eye[2], eye[4]);
+    const c = dist(eye[0], eye[3]);
+    return (a + b) / (2 * c);
+  };
+
   const computeSharpness = (videoEl: HTMLVideoElement, box: faceapi.Box) => {
     const vw = videoEl.videoWidth || 0;
     const vh = videoEl.videoHeight || 0;
@@ -277,6 +316,8 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
           const quality = computeSharpness(videoRef.current, box);
           const sharpness = quality?.sharpness ?? null;
           const brightness = quality?.brightness ?? null;
+          const yaw = computeYaw(detection.landmarks, box);
+          const currentStep = FACE_STEPS[stepIndex] as Step;
 
           let hint: string | null = null;
           if (typeof score === 'number' && score < 0.7) hint = 'Face not clear enough. Hold still.';
@@ -285,6 +326,30 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
           if (Math.abs(rollDeg) > 12) hint = 'Keep your head straight.';
           if (typeof sharpness === 'number' && sharpness < 120) hint = 'Too blurry. Improve lighting and hold still.';
           if (typeof brightness === 'number' && brightness < 45) hint = 'Too dark. Add more light.';
+
+          if (!hint) {
+            if (currentStep === 'Front' && Math.abs(yaw) > 0.08) hint = 'Face forward (straight).';
+            if (currentStep === 'Left' && yaw > -0.18) hint = 'Turn your head LEFT.';
+            if (currentStep === 'Right' && yaw < 0.18) hint = 'Turn your head RIGHT.';
+            if (currentStep === 'Blink') {
+              const leftEAR = computeEyeAspectRatio(leftEye);
+              const rightEAR = computeEyeAspectRatio(rightEye);
+              const ear = leftEAR !== null && rightEAR !== null ? (leftEAR + rightEAR) / 2 : null;
+              const closed = ear !== null ? ear < 0.21 : false;
+
+              if (blinkStateRef.current === 'need_close') {
+                if (closed) blinkStateRef.current = 'need_open';
+                hint = 'Blink now.';
+              } else if (blinkStateRef.current === 'need_open') {
+                if (!closed) blinkStateRef.current = 'done';
+                hint = 'Open your eyes.';
+              } else {
+                void 0;
+              }
+            } else {
+              void 0;
+            }
+          }
 
           if (hint) {
             setQualityHint(hint);
@@ -305,15 +370,27 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
               setStableCount(Math.min(nextCount, requiredStable));
 
               if (nextCount >= requiredStable) {
-                captureInProgressRef.current = true;
-                const dims = descriptor.length;
-                const avg = new Array<number>(dims).fill(0);
-                for (const d of stableDescriptorsRef.current.slice(-requiredStable)) {
-                  for (let i = 0; i < dims; i += 1) avg[i] += d[i];
-                }
-                for (let i = 0; i < dims; i += 1) avg[i] /= requiredStable;
+                const stepAvg = averageDescriptors(stableDescriptorsRef.current.slice(-requiredStable));
+                stepAveragesRef.current.push(stepAvg);
+                stableDescriptorsRef.current = [];
+                lastDescriptorRef.current = null;
+                setStableCount(0);
 
-                onFaceCaptured(avg);
+                if (currentStep === 'Blink' && blinkStateRef.current !== 'done') {
+                  stepAveragesRef.current.pop();
+                } else if (currentStep === 'Blink') {
+                  void 0;
+                }
+
+                if (stepIndex < FACE_STEPS.length - 1) {
+                  if (currentStep === 'Blink') blinkStateRef.current = 'need_close';
+                  setStepIndex((i) => i + 1);
+                  return;
+                }
+
+                captureInProgressRef.current = true;
+                const finalAvg = averageDescriptors(stepAveragesRef.current);
+                onFaceCaptured(Array.from(finalAvg));
                 setThumbnail(captureThumbnail());
                 setCaptured(true);
                 setDetecting(false);
@@ -353,7 +430,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
         rafRef.current = null;
       }
     };
-  }, [cameraActive, detecting, captured, onFaceCaptured, qualityHint]);
+  }, [cameraActive, detecting, captured, onFaceCaptured, qualityHint, stepIndex]);
 
   const handleRetake = () => {
     stopCamera();
@@ -361,6 +438,11 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     setCaptured(false);
     setThumbnail(null);
     setError(null);
+    setStepIndex(0);
+    setStableCount(0);
+    setQualityHint(null);
+    stepAveragesRef.current = [];
+    blinkStateRef.current = 'need_close';
     onFaceCaptured(null);
   };
 
@@ -397,7 +479,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
             </p>
           ) : detecting ? (
             <p className="text-xs text-gray-400">
-              {qualityHint ? qualityHint : `Hold still... ${stableCount}/${requiredStable}`}
+              {qualityHint ? qualityHint : `Step: ${FACE_STEPS[stepIndex]} • ${stableCount}/${requiredStable}`}
             </p>
           ) : (
             <p className="text-xs text-gray-400">Tap to open camera</p>
@@ -406,10 +488,20 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
 
         <div className={`w-full ${cameraActive || captured || error ? '' : 'hidden'}`}>
           <div className={`relative w-full overflow-hidden rounded-lg border border-gray-700 bg-black ${cameraActive ? '' : 'hidden'}`}>
-            <video ref={videoRef} className="w-full aspect-square object-cover" playsInline muted autoPlay />
+            <video ref={videoRef} className="w-full aspect-square object-cover -scale-x-100" playsInline muted autoPlay />
+            <div className="pointer-events-none absolute inset-0">
+              <div className="absolute inset-6 rounded-full border-2 border-white/60"></div>
+              <div className="absolute left-1/2 top-0 bottom-0 w-px bg-white/30"></div>
+              <div className="absolute top-1/2 left-0 right-0 h-px bg-white/30"></div>
+              <div className="absolute left-8 right-8 top-8 bottom-8 rounded-3xl border border-white/10"></div>
+            </div>
             <div className="absolute bottom-2 left-2 right-2 text-center">
               <span className="text-xs bg-black/60 text-white px-2 py-1 rounded">
-                {detecting ? (qualityHint ? qualityHint : `Detecting... ${stableCount}/${requiredStable}`) : 'Camera ready'}
+                {detecting
+                  ? qualityHint
+                    ? qualityHint
+                    : `Step: ${FACE_STEPS[stepIndex]} • ${stableCount}/${requiredStable}`
+                  : 'Camera ready'}
               </span>
             </div>
           </div>

@@ -21,6 +21,17 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
   const startedRef = useRef(false);
   const modelsReadyRef = useRef(false);
 
+  const getCameraError = (e: unknown) => {
+    if (e && typeof e === 'object' && 'name' in e) {
+      const name = String((e as { name?: unknown }).name);
+      if (name === 'NotAllowedError' || name === 'SecurityError') return 'Camera permission denied';
+      if (name === 'NotFoundError') return 'Requested device not found';
+      if (name === 'NotReadableError') return 'Camera is already in use';
+      if (name === 'OverconstrainedError') return 'Camera constraints not supported';
+    }
+    return getErrorMessage(e) ?? 'Failed to access camera';
+  };
+
   const stopCamera = () => {
     if (rafRef.current) {
       cancelAnimationFrame(rafRef.current);
@@ -65,6 +76,15 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     }
   };
 
+  const waitForVideoElement = async (timeoutMs: number) => {
+    const startedAt = Date.now();
+    while (!videoRef.current) {
+      if (Date.now() - startedAt > timeoutMs) throw new Error('Camera preview unavailable');
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }
+    return videoRef.current;
+  };
+
   const startCamera = async () => {
     if (startedRef.current) return;
     startedRef.current = true;
@@ -75,24 +95,39 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error('Camera not supported on this device/browser');
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: 'user' },
-          width: { ideal: 720 },
-          height: { ideal: 720 },
-        },
-        audio: false,
-      });
+      if (!window.isSecureContext && window.location.hostname !== 'localhost') {
+        throw new Error('Camera requires HTTPS');
+      }
+
+      let stream: MediaStream | null = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'user' },
+            width: { ideal: 720 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        });
+      } catch (e) {
+        const message = getCameraError(e);
+        if (message === 'Requested device not found' || message === 'Camera constraints not supported') {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        } else {
+          throw e;
+        }
+      }
 
       streamRef.current = stream;
-      setCameraActive(true);
 
-      if (!videoRef.current) throw new Error('Camera preview unavailable');
-      videoRef.current.srcObject = stream;
-      await videoRef.current.play();
+      const videoEl = await waitForVideoElement(1500);
+      videoEl.setAttribute('playsinline', 'true');
+      videoEl.muted = true;
+      videoEl.srcObject = stream;
+      setCameraActive(true);
+      await videoEl.play();
     } catch (e) {
-      const message = getErrorMessage(e) ?? 'Failed to access camera';
-      setError(message);
+      setError(getCameraError(e));
       stopCamera();
       startedRef.current = false;
       setStarting(false);
@@ -221,30 +256,24 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
           )}
         </div>
 
-        {(cameraActive || captured || error) && (
-          <div className="w-full">
-            {cameraActive && (
-              <div className="relative w-full overflow-hidden rounded-lg border border-gray-700 bg-black">
-                <video ref={videoRef} className="w-full aspect-square object-cover" playsInline muted autoPlay />
-                <div className="absolute bottom-2 left-2 right-2 text-center">
-                  <span className="text-xs bg-black/60 text-white px-2 py-1 rounded">
-                    {detecting ? 'Detecting face...' : 'Camera ready'}
-                  </span>
-                </div>
-              </div>
-            )}
-
-            {captured && thumbnail && (
-              <div className="flex items-center justify-center">
-                <img
-                  src={thumbnail}
-                  alt="Face thumbnail"
-                  className="mt-2 w-20 h-20 rounded-lg object-cover border border-gray-700"
-                />
-              </div>
-            )}
+        <div className={`w-full ${cameraActive || captured || error ? '' : 'hidden'}`}>
+          <div className={`relative w-full overflow-hidden rounded-lg border border-gray-700 bg-black ${cameraActive ? '' : 'hidden'}`}>
+            <video ref={videoRef} className="w-full aspect-square object-cover" playsInline muted autoPlay />
+            <div className="absolute bottom-2 left-2 right-2 text-center">
+              <span className="text-xs bg-black/60 text-white px-2 py-1 rounded">
+                {detecting ? 'Detecting face...' : 'Camera ready'}
+              </span>
+            </div>
           </div>
-        )}
+
+          <div className={captured && thumbnail ? 'flex items-center justify-center' : 'hidden'}>
+            <img
+              src={thumbnail ?? ''}
+              alt="Face thumbnail"
+              className="mt-2 w-20 h-20 rounded-lg object-cover border border-gray-700"
+            />
+          </div>
+        </div>
 
         <div className="w-full flex gap-2">
           {!captured ? (

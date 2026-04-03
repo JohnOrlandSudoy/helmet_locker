@@ -41,7 +41,6 @@ export type EnrollRequest = {
 export type UnlockRequest = {
   id: string;
   user_id: string | null;
-  method: 'admin' | 'face';
   processed: boolean;
-  created_at: string;
+  requested_at: string;
 };

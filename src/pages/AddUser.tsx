@@ -7,6 +7,7 @@ import { createEnrollRequest, getNextFingerprintId, watchEnrollRequest } from '.
 import { getErrorMessage } from '../lib/errors';
 
 const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[] | null) => void }) => {
+  const requiredStable = 3;
   const [cameraActive, setCameraActive] = useState(false);
   const [starting, setStarting] = useState(false);
   const [detecting, setDetecting] = useState(false);
@@ -14,12 +15,16 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
   const [captured, setCaptured] = useState(false);
   const [thumbnail, setThumbnail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [stableCount, setStableCount] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
   const startedRef = useRef(false);
   const modelsReadyRef = useRef(false);
+  const lastDescriptorRef = useRef<Float32Array | null>(null);
+  const stableDescriptorsRef = useRef<Float32Array[]>([]);
+  const captureInProgressRef = useRef(false);
 
   const getCameraError = (e: unknown) => {
     if (e && typeof e === 'object' && 'name' in e) {
@@ -46,6 +51,10 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     }
     setCameraActive(false);
     setDetecting(false);
+    setStableCount(0);
+    lastDescriptorRef.current = null;
+    stableDescriptorsRef.current = [];
+    captureInProgressRef.current = false;
   };
 
   useEffect(() => {
@@ -172,10 +181,11 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
   useEffect(() => {
     if (!cameraActive || !detecting || captured) return;
     if (!modelsReadyRef.current) return;
+    if (captureInProgressRef.current) return;
 
     const options = new faceapi.TinyFaceDetectorOptions({
-      inputSize: 224,
-      scoreThreshold: 0.5,
+      inputSize: 416,
+      scoreThreshold: 0.65,
     });
 
     const loop = async () => {
@@ -188,14 +198,55 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
           .withFaceLandmarks()
           .withFaceDescriptor();
 
-        if (detection?.descriptor) {
-          const descriptorArray = Array.from(detection.descriptor);
-          onFaceCaptured(descriptorArray);
-          setThumbnail(captureThumbnail());
-          setCaptured(true);
-          setDetecting(false);
-          stopCamera();
-          return;
+        const descriptor = detection?.descriptor ?? null;
+        const box = detection?.detection?.box ?? null;
+
+        if (descriptor && box) {
+          const videoW = videoRef.current.videoWidth || 1;
+          const videoH = videoRef.current.videoHeight || 1;
+          const faceAreaRatio = (box.width * box.height) / (videoW * videoH);
+
+          if (faceAreaRatio < 0.06) {
+            setStableCount(0);
+            lastDescriptorRef.current = null;
+            stableDescriptorsRef.current = [];
+          } else {
+            const last = lastDescriptorRef.current;
+            const distance = last ? faceapi.euclideanDistance(last, descriptor) : 0;
+            const stable = !last || distance < 0.45;
+
+            if (stable) {
+              stableDescriptorsRef.current.push(descriptor);
+              lastDescriptorRef.current = descriptor;
+              const nextCount = stableDescriptorsRef.current.length;
+              setStableCount(Math.min(nextCount, requiredStable));
+
+              if (nextCount >= requiredStable) {
+                captureInProgressRef.current = true;
+                const dims = descriptor.length;
+                const avg = new Array<number>(dims).fill(0);
+                for (const d of stableDescriptorsRef.current.slice(-requiredStable)) {
+                  for (let i = 0; i < dims; i += 1) avg[i] += d[i];
+                }
+                for (let i = 0; i < dims; i += 1) avg[i] /= requiredStable;
+
+                onFaceCaptured(avg);
+                setThumbnail(captureThumbnail());
+                setCaptured(true);
+                setDetecting(false);
+                stopCamera();
+                return;
+              }
+            } else {
+              lastDescriptorRef.current = descriptor;
+              stableDescriptorsRef.current = [descriptor];
+              setStableCount(1);
+            }
+          }
+        } else {
+          setStableCount(0);
+          lastDescriptorRef.current = null;
+          stableDescriptorsRef.current = [];
         }
       } catch (e) {
         setError(getErrorMessage(e) ?? 'Face detection failed');
@@ -260,6 +311,10 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
             <p className="text-xs text-gray-400">
               {starting ? 'Opening camera...' : 'Loading face models...'}
             </p>
+          ) : detecting ? (
+            <p className="text-xs text-gray-400">
+              Hold still... {stableCount}/{requiredStable}
+            </p>
           ) : (
             <p className="text-xs text-gray-400">Tap to open camera</p>
           )}
@@ -270,7 +325,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
             <video ref={videoRef} className="w-full aspect-square object-cover" playsInline muted autoPlay />
             <div className="absolute bottom-2 left-2 right-2 text-center">
               <span className="text-xs bg-black/60 text-white px-2 py-1 rounded">
-                {detecting ? 'Detecting face...' : 'Camera ready'}
+                {detecting ? `Detecting... ${stableCount}/${requiredStable}` : 'Camera ready'}
               </span>
             </div>
           </div>
@@ -337,10 +392,16 @@ export default function AddUser() {
 
   const enrollChannelRef = useRef<ReturnType<typeof watchEnrollRequest> | null>(null);
   const enrollTimeoutRef = useRef<number | null>(null);
+  const autoSavedRef = useRef(false);
 
   const handleFaceCaptured = useCallback((descriptor: number[] | null) => {
     setFaceDescriptor(descriptor);
+    autoSavedRef.current = false;
   }, []);
+
+  useEffect(() => {
+    autoSavedRef.current = false;
+  }, [name, rfidUid, fingerprintId]);
 
   useEffect(() => {
     return () => {
@@ -439,19 +500,29 @@ export default function AddUser() {
     setEnrollingFingerprint(false);
   };
 
-  const handleSave = async () => {
+  const saveUser = useCallback(async () => {
     if (!name.trim()) {
       toast.error('Please enter a name');
-      return;
+      return false;
     }
 
     if (!rfidUid && !fingerprintId && !faceDescriptor) {
       toast.error('Please enroll at least one authentication method');
-      return;
+      return false;
     }
 
     setSaving(true);
     try {
+      const {
+        data: { session },
+        error: sessionError,
+      } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (!session) {
+        toast.error('Please sign in again');
+        return false;
+      }
+
       const { error } = await supabase.from('users').insert({
         name: name.trim(),
         rfid_uid: rfidUid,
@@ -466,12 +537,30 @@ export default function AddUser() {
       setRfidUid(null);
       setFingerprintId(null);
       setFaceDescriptor(null);
+      autoSavedRef.current = false;
+      return true;
     } catch (error) {
-      toast.error(getErrorMessage(error) ?? 'Failed to save user');
+      const message = getErrorMessage(error) ?? 'Failed to save user';
+      if (message.toLowerCase().includes('row-level security') || message.toLowerCase().includes('rls')) {
+        toast.error('RLS blocked insert to users. Fix Supabase policy for authenticated inserts.');
+      } else {
+        toast.error(message);
+      }
+      return false;
     } finally {
       setSaving(false);
     }
-  };
+  }, [faceDescriptor, fingerprintId, name, rfidUid]);
+
+  useEffect(() => {
+    if (!faceDescriptor) return;
+    if (!name.trim()) return;
+    if (saving) return;
+    if (autoSavedRef.current) return;
+
+    autoSavedRef.current = true;
+    void saveUser();
+  }, [faceDescriptor, name, saving, saveUser]);
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
@@ -557,7 +646,7 @@ export default function AddUser() {
       </div>
 
       <button
-        onClick={handleSave}
+        onClick={saveUser}
         disabled={saving || !name.trim()}
         className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-4 px-6 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
       >

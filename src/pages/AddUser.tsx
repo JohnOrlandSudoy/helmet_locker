@@ -60,16 +60,25 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     setModelLoading(true);
     try {
       const timeoutMs = 15000;
-      await Promise.race([
-        Promise.all([
-          faceapi.nets.tinyFaceDetector.loadFromUri('/models'),
-          faceapi.nets.faceLandmark68Net.loadFromUri('/models'),
-          faceapi.nets.faceRecognitionNet.loadFromUri('/models'),
-        ]),
-        new Promise((_, reject) => {
-          window.setTimeout(() => reject(new Error('Face models load timeout')), timeoutMs);
-        }),
-      ]);
+      const loadFromBaseUri = async (baseUri: string) => {
+        await Promise.race([
+          Promise.all([
+            faceapi.nets.tinyFaceDetector.loadFromUri(baseUri),
+            faceapi.nets.faceLandmark68Net.loadFromUri(baseUri),
+            faceapi.nets.faceRecognitionNet.loadFromUri(baseUri),
+          ]),
+          new Promise((_, reject) => {
+            window.setTimeout(() => reject(new Error('Face models load timeout')), timeoutMs);
+          }),
+        ]);
+      };
+
+      try {
+        await loadFromBaseUri('/models');
+      } catch {
+        await loadFromBaseUri('https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights');
+      }
+
       modelsReadyRef.current = true;
     } finally {
       setModelLoading(false);

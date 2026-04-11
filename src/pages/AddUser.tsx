@@ -6,7 +6,7 @@ import { toast } from 'sonner';
 import { createEnrollRequest, getNextFingerprintId, watchEnrollRequest } from '../lib/enrollRequests';
 import { getErrorMessage } from '../lib/errors';
 
-const FACE_STEPS = ['Front', 'Left', 'Right', 'Blink'] as const;
+const FACE_STEPS = ['Front', 'Left', 'Right'] as const;
 
 const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[] | null) => void }) => {
   const requiredStable = 5;
@@ -31,7 +31,6 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
   const stableDescriptorsRef = useRef<Float32Array[]>([]);
   const captureInProgressRef = useRef(false);
   const stepAveragesRef = useRef<Float32Array[]>([]);
-  const blinkStateRef = useRef<'need_close' | 'need_open' | 'done'>('need_close');
 
   const getCameraError = (e: unknown) => {
     if (e && typeof e === 'object' && 'name' in e) {
@@ -65,7 +64,6 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     stableDescriptorsRef.current = [];
     captureInProgressRef.current = false;
     stepAveragesRef.current = [];
-    blinkStateRef.current = 'need_close';
   };
 
   useEffect(() => {
@@ -210,15 +208,6 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     return userYaw;
   };
 
-  const computeEyeAspectRatio = (eye: faceapi.Point[]) => {
-    if (eye.length < 6) return null;
-    const dist = (a: faceapi.Point, b: faceapi.Point) => Math.hypot(a.x - b.x, a.y - b.y);
-    const a = dist(eye[1], eye[5]);
-    const b = dist(eye[2], eye[4]);
-    const c = dist(eye[0], eye[3]);
-    return (a + b) / (2 * c);
-  };
-
   const computeSharpness = (videoEl: HTMLVideoElement, box: faceapi.Box) => {
     const vw = videoEl.videoWidth || 0;
     const vh = videoEl.videoHeight || 0;
@@ -331,24 +320,6 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
             if (currentStep === 'Front' && Math.abs(yaw) > 0.08) hint = 'Face forward (straight).';
             if (currentStep === 'Left' && yaw > -0.18) hint = 'Turn your head LEFT.';
             if (currentStep === 'Right' && yaw < 0.18) hint = 'Turn your head RIGHT.';
-            if (currentStep === 'Blink') {
-              const leftEAR = computeEyeAspectRatio(leftEye);
-              const rightEAR = computeEyeAspectRatio(rightEye);
-              const ear = leftEAR !== null && rightEAR !== null ? (leftEAR + rightEAR) / 2 : null;
-              const closed = ear !== null ? ear < 0.21 : false;
-
-              if (blinkStateRef.current === 'need_close') {
-                if (closed) blinkStateRef.current = 'need_open';
-                hint = 'Blink now.';
-              } else if (blinkStateRef.current === 'need_open') {
-                if (!closed) blinkStateRef.current = 'done';
-                hint = 'Open your eyes.';
-              } else {
-                void 0;
-              }
-            } else {
-              void 0;
-            }
           }
 
           if (hint) {
@@ -376,14 +347,7 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
                 lastDescriptorRef.current = null;
                 setStableCount(0);
 
-                if (currentStep === 'Blink' && blinkStateRef.current !== 'done') {
-                  stepAveragesRef.current.pop();
-                } else if (currentStep === 'Blink') {
-                  void 0;
-                }
-
                 if (stepIndex < FACE_STEPS.length - 1) {
-                  if (currentStep === 'Blink') blinkStateRef.current = 'need_close';
                   setStepIndex((i) => i + 1);
                   return;
                 }
@@ -442,7 +406,6 @@ const FaceCapture = ({ onFaceCaptured }: { onFaceCaptured: (descriptor: number[]
     setStableCount(0);
     setQualityHint(null);
     stepAveragesRef.current = [];
-    blinkStateRef.current = 'need_close';
     onFaceCaptured(null);
   };
 
